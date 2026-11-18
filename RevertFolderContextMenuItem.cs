@@ -1,10 +1,10 @@
-﻿using Frosty.Controls;
+using Frosty.Controls;
 using Frosty.Core;
 using Frosty.Core.Controls;
 using Frosty.Core.Windows;
 using FrostySdk.Ebx;
+using FrostySdk.IO;
 using FrostySdk.Managers;
-using FrostySdk.Managers.Entries;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -223,11 +223,14 @@ namespace RevertFolderPlugin
                 //FrostyMessageBox.Show("No modified assets found to revert.", "Revert Folder");
             }
 
-            App.EditorWindow.DataExplorer.RefreshItems();
-
-            // Refresh UI
+            // Refresh UI. In 1.0.6.3 RefreshItems() only refreshes the list view, so use
+            // RefreshAll() (same as the built-in Revert) to rebuild the tree and drop
+            // reverted added assets. It keeps the currently selected folder.
             if (!refreshExplorer)
-                return; // Do not adjust the view            
+            {
+                App.EditorWindow.DataExplorer.RefreshAll();
+                return; // Do not adjust the view
+            }
 
             App.EditorWindow.DataExplorer.ItemsSource = App.AssetManager.EnumerateEbx();
 
@@ -314,13 +317,21 @@ namespace RevertFolderPlugin
 
                 visited.Add(obj);
 
-                // EBX pointer reference
-                if (obj is PointerRef pointer && pointer.External != null)
+                // EBX pointer reference. In 1.0.6.3 PointerRef/EbxImportReference are structs,
+                // so check the pointer type instead of comparing External to null.
+                if (obj is PointerRef pointer)
                 {
-                    var guid = pointer.External.FileGuid;
-                    var entry = App.AssetManager.GetEbxEntry(guid);
-                    if (entry != null)
-                        result.Add(entry);
+                    if (pointer.Type == PointerRefType.External)
+                    {
+                        var entry = App.AssetManager.GetEbxEntry(pointer.External.FileGuid);
+                        if (entry != null)
+                            result.Add(entry);
+                    }
+                    else if (pointer.Type == PointerRefType.Internal)
+                    {
+                        // Follow references held by objects inside the same asset
+                        Walk(pointer.Internal);
+                    }
 
                     return;
                 }
@@ -363,40 +374,45 @@ namespace RevertFolderPlugin
             if (!entry.IsModified)
                 return;
 
-            // Access the EditorWindow instance
-            var editorWindow = App.EditorWindow;
-
-            // Use reflection to get the private TabControl
-            var tabControlField = editorWindow.GetType().GetField("TabControl", BindingFlags.Instance | BindingFlags.NonPublic);
-            if (tabControlField == null)
+            // In 1.0.6.3 IEditorWindow does not expose the asset editor tab control
+            // (MiscTabControl is the separate "misc" tab strip), so get the concrete
+            // MainWindow and its private "tabControl" field via reflection.
+            var editorWindow = Application.Current.MainWindow;
+            if (editorWindow == null)
                 return;
 
-            TabControl tabControl = tabControlField.GetValue(editorWindow) as TabControl;
+            var windowType = editorWindow.GetType();
+            var tabControlField = windowType.GetField("tabControl", BindingFlags.Instance | BindingFlags.NonPublic);
+            TabControl tabControl = tabControlField?.GetValue(editorWindow) as TabControl;
             if (tabControl == null)
                 return;
 
-            // Iterate through the tabs and close the matching one
+            // Index 0 is the welcome tab, so start at 1
             for (int i = 1; i < tabControl.Items.Count; i++)
             {
                 FrostyTabItem tabItem = tabControl.Items[i] as FrostyTabItem;
-                if (tabItem != null && tabItem.TabId == entry.Name)
+                if (tabItem == null || tabItem.TabId != entry.Name)
+                    continue;
+
+                // Use MainWindow's own public close helpers so the toolbar and
+                // welcome tab are restored exactly like a normal tab close.
+                if (tabItem.Content is FrostyAssetEditor assetEditor)
                 {
-                    // Call Editor-Closed methods
-                    (tabItem.Content as FrostyBaseEditor)?.Closed();
-                    (tabItem.Content as FrostyAssetEditor)?.Closed();
-
-                    // Remove the tab
-                    tabControl.Items.Remove(tabItem);
-
-                    // If only the first (default) tab remains
-                    if (tabControl.Items.Count == 1)
+                    var shutdown = windowType.GetMethod("ShutdownEditorAndRemoveTab", BindingFlags.Instance | BindingFlags.Public);
+                    if (shutdown != null)
                     {
-                        FrostyTabItem defaultTab = tabControl.Items[0] as FrostyTabItem;
-                        defaultTab.Visibility = System.Windows.Visibility.Visible;
-                        defaultTab.IsSelected = true;
+                        shutdown.Invoke(editorWindow, new object[] { assetEditor, tabItem });
+                        break;
                     }
-                    break;
                 }
+
+                var removeTab = windowType.GetMethod("RemoveTab", BindingFlags.Instance | BindingFlags.Public);
+                if (removeTab != null)
+                {
+                    (tabItem.Content as FrostyAssetEditor)?.Closed();
+                    removeTab.Invoke(editorWindow, new object[] { tabItem });
+                }
+                break;
             }
         }
     }
