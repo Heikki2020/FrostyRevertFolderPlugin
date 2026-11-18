@@ -1,0 +1,87 @@
+name: Build RevertFolderPlugin (Fork 1.0.6.3)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      toolsuite_ref:
+        description: 'FrostyToolsuite branch/tag/commit to build against'
+        required: false
+        default: '1.0.6.3'
+
+permissions:
+  contents: write   # needed only to attach the DLL to a release on tag pushes
+
+env:
+  TOOLSUITE_REPO: CadeEvs/FrostyToolsuite
+  TOOLSUITE_REF: ${{ github.event.inputs.toolsuite_ref || '1.0.6.3' }}
+  BUILD_CONFIG: Release - Final
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      - name: Checkout FrostyToolsuite
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TOOLSUITE_REPO }}
+          ref: ${{ env.TOOLSUITE_REF }}
+          path: FrostyToolsuite
+
+      - name: Copy plugin into FrostyToolsuite\Plugins
+        shell: pwsh
+        run: |
+          $dest = "FrostyToolsuite/Plugins/RevertFolderPlugin"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Get-ChildItem -Path plugin -Force |
+            Where-Object { $_.Name -notin @('.git', '.github') } |
+            Copy-Item -Destination $dest -Recurse -Force
+          Get-ChildItem $dest
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # FrostyHash.vcxproj is pinned to the VS2017 toolset (v141), which hosted
+      # runners don't ship, so override it with the VS2022 toolset (v143).
+      # SolutionDir is set because the plugin's post-build step uses it and we
+      # build the project directly instead of through FrostyEditor.sln.
+      - name: Build RevertFolderPlugin
+        shell: cmd
+        run: >
+          msbuild FrostyToolsuite\Plugins\RevertFolderPlugin\RevertFolderPlugin.csproj
+          -restore
+          "-p:Configuration=${{ env.BUILD_CONFIG }}"
+          -p:Platform=x64
+          -p:PlatformToolset=v143
+          "-p:SolutionDir=%GITHUB_WORKSPACE%\FrostyToolsuite\FrostyEditor\\"
+          -verbosity:minimal
+
+      - name: Locate DLL
+        id: dll
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path FrostyToolsuite/Plugins/RevertFolderPlugin/bin -Recurse -Filter RevertFolderPlugin.dll | Select-Object -First 1
+          if (-not $dll) { throw "RevertFolderPlugin.dll was not produced" }
+          Write-Host "Built: $($dll.FullName)"
+          "path=$($dll.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RevertFolderPlugin-fork-${{ env.TOOLSUITE_REF }}
+          path: ${{ steps.dll.outputs.path }}
+          if-no-files-found: error
+
+      - name: Attach DLL to release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.dll.outputs.path }}
